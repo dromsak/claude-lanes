@@ -1,0 +1,14 @@
+{
+  "name": "lanes",
+  "owner": {
+    "name": "dromsak",
+    "url": "https://github.com/dromsak"
+  },
+  "plugins": [
+    {
+      "name": "lanes",
+      "source": "./",
+      "description": "Work a GitHub issue backlog three at a time: an orchestrator session, Sonnet workers in git worktrees, a Haiku reader for scoping, and a merge train behind your test gate."
+    }
+  ]
+}

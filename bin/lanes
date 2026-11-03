@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+# lanes: a pool of git worktrees ("lanes") for parallel Claude Code workers,
+# plus the merge train that lands their branches one at a time.
+#
+#   lanes init                      create the lane worktrees
+#   lanes status                    show each lane and what holds it
+#   lanes acquire <branch>          lease a free lane on <branch>; prints its path
+#   lanes release <n> [--force]     reset lane <n> to main and free it
+#   lanes gate                      run the merge gate in the current directory
+#   lanes train <branch>...         land each branch: rebase, gate, merge
+#
+# Settings live in the repo's git config (shared by every worktree):
+#   lanes.gate   the command that must pass before anything lands (required)
+#   lanes.count  how many lanes (default 3)
+#   lanes.base   where lanes live (default: <repo>-lanes beside the repo)
+#   lanes.main   the branch work lands on (default: origin's HEAD, else main)
+#   lanes.merge  squash | rebase | merge (through gh) | push (fast-forward
+#                push to main, no gh needed) (default squash)
+#
+# A lane is reset with `git clean -fd`, never -x: ignored build output and
+# dependency folders survive, so a lane stays warm between tasks.
+set -euo pipefail
+
+say() { printf '%s\n' "$*" >&2; }
+die() {
+  say "lanes: $*"
+  exit 1
+}
+
+COMMON=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) ||
+  die "run this inside a git repository"
+[ "${COMMON##*/}" = ".git" ] || die "needs a normal clone (git dir at <repo>/.git), found $COMMON"
+REPO=${COMMON%/.git}
+
+cfg() { git -C "$REPO" config --get "lanes.$1" || printf '%s' "${2:-}"; }
+
+BASE=$(cfg base "$(dirname "$REPO")/$(basename "$REPO")-lanes")
+COUNT=$(cfg count 3)
+[[ "$COUNT" =~ ^[1-9][0-9]*$ ]] || die "lanes.count must be a positive number"
+MAIN=$(cfg main "")
+if [ -z "$MAIN" ]; then
+  MAIN=$(git -C "$REPO" symbolic-ref --short -q refs/remotes/origin/HEAD 2>/dev/null || true)
+  MAIN=${MAIN#origin/}
+  MAIN=${MAIN:-main}
+fi
+LEASES="$BASE/.leases"
+
+lane_dir() { printf '%s/lane-%s' "$BASE" "$1"; }
+now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+fetch() {
+  git -C "$REPO" fetch -q origin 2>/dev/null ||
+    say "warning: fetch failed, using the last-fetched origin refs"
+}
+
+ensure_lane() {
+  local dir
+  dir=$(lane_dir "$1")
+  [ -d "$dir" ] && return 0
+  say "creating lane-$1 at $dir"
+  git -C "$REPO" worktree add -q --detach "$dir" "origin/$MAIN" >&2
+}
+
+cmd_init() {
+  mkdir -p "$LEASES"
+  fetch
+  local i
+  for i in $(seq 1 "$COUNT"); do ensure_lane "$i"; done
+  [ -n "$(cfg gate)" ] || say "next: set the merge gate, e.g. git config lanes.gate 'npm test'"
+  cmd_status
+}
+
+cmd_status() {
+  local i dir
+  printf 'base %s  main %s  gate %s\n' "$BASE" "$MAIN" "$(cfg gate '(unset)')"
+  for i in $(seq 1 "$COUNT"); do
+    dir=$(lane_dir "$i")
+    if [ ! -d "$dir" ]; then
+      printf 'lane-%s  missing (run: lanes init)\n' "$i"
+    elif [ -d "$LEASES/lane-$i" ]; then
+      printf 'lane-%s  LEASED  %s  %s\n' "$i" "$dir" "$(tr '\n' ' ' <"$LEASES/lane-$i/meta" 2>/dev/null || true)"
+    else
+      printf 'lane-%s  free    %s\n' "$i" "$dir"
+    fi
+  done
+}
+
+cmd_acquire() {
+  local branch="${1:-}" start i dir
+  [ -n "$branch" ] || die "usage: lanes acquire <branch>"
+  git check-ref-format --branch "$branch" >/dev/null 2>&1 || die "not a valid branch name: $branch"
+  mkdir -p "$LEASES"
+  fetch
+  # A branch already on origin (a send-back, a failed train) resumes from there.
+  start="origin/$MAIN"
+  git -C "$REPO" rev-parse -q --verify "refs/remotes/origin/$branch" >/dev/null && start="origin/$branch"
+  for i in $(seq 1 "$COUNT"); do
+    mkdir "$LEASES/lane-$i" 2>/dev/null || continue # mkdir is the atomic lease
+    dir=$(lane_dir "$i")
+    if ensure_lane "$i" &&
+      git -C "$dir" reset -q --hard &&
+      git -C "$dir" clean -fdq &&
+      git -C "$dir" checkout -q -B "$branch" "$start"; then
+      printf 'branch=%s\nleased=%s\n' "$branch" "$(now)" >"$LEASES/lane-$i/meta"
+      printf '%s\n' "$dir"
+      return 0
+    fi
+    rm -rf "$LEASES/lane-$i"
+    die "could not prepare lane-$i for $branch (is that branch checked out in another lane?)"
+  done
+  die "no free lane: all $COUNT are leased (lanes status)"
+}
+
+cmd_release() {
+  local n="${1:-}" force="${2:-}" dir branch=""
+  n=${n##*lane-}
+  [[ "$n" =~ ^[0-9]+$ ]] || die "usage: lanes release <n> [--force]"
+  dir=$(lane_dir "$n")
+  [ -d "$dir" ] || die "lane-$n does not exist"
+  [ -f "$LEASES/lane-$n/meta" ] && branch=$(sed -n 's/^branch=//p' "$LEASES/lane-$n/meta")
+  # Release resets the tree, so refuse while it holds work no remote has.
+  if [ "$force" != "--force" ]; then
+    if [ -n "$(git -C "$dir" status --porcelain)" ] ||
+      [ -n "$(git -C "$dir" rev-list -n1 HEAD --not --remotes)" ]; then
+      die "lane-$n holds uncommitted or unpushed work; push it first, or release with --force to discard it"
+    fi
+  fi
+  git -C "$dir" reset -q --hard
+  git -C "$dir" clean -fdq
+  git -C "$dir" checkout -q --detach "origin/$MAIN"
+  if [ -n "$branch" ]; then git -C "$REPO" branch -q -D "$branch" 2>/dev/null || true; fi
+  rm -rf "$LEASES/lane-$n"
+  say "lane-$n released"
+}
+
+cmd_gate() {
+  local gate
+  gate=$(cfg gate)
+  [ -n "$gate" ] || die "no gate set: git config lanes.gate '<command>'"
+  say "gate: $gate"
+  exec bash -c "$gate"
+}
+
+# land <branch>: one attempt. Returns 0 landed, 1 failed, 2 main moved (retry).
+land() {
+  local b="$1" head base tip
+  head=$(git -C "$REPO" rev-parse -q --verify "refs/remotes/origin/$b") || {
+    echo "TRAIN $b: SKIPPED (no origin/$b)"
+    return 1
+  }
+  base=$(git -C "$REPO" rev-parse "refs/remotes/origin/$MAIN")
+  git -C "$TRAIN" reset -q --hard
+  git -C "$TRAIN" clean -fdq
+  git -C "$TRAIN" checkout -q --detach "$head"
+  if ! git -C "$TRAIN" rebase -q "$base" >/dev/null 2>&1; then
+    git -C "$TRAIN" rebase --abort 2>/dev/null || true
+    echo "TRAIN $b: FAILED (conflicts with $MAIN; rebase it in a lane)"
+    return 1
+  fi
+  tip=$(git -C "$TRAIN" rev-parse HEAD)
+  if [ "$tip" = "$base" ]; then
+    echo "TRAIN $b: SKIPPED (nothing to land, already in $MAIN)"
+    return 1
+  fi
+  if ! (cd "$TRAIN" && bash -c "$GATE"); then
+    echo "TRAIN $b: FAILED (gate red; output above)"
+    return 1
+  fi
+  # Main may have moved while the gate ran; never land an untested combination.
+  [ "$(git -C "$REPO" ls-remote origin "refs/heads/$MAIN" | cut -f1)" = "$base" ] || return 2
+  # The PR head becomes exactly the tree the gate passed.
+  if [ "$tip" != "$head" ]; then
+    git -C "$TRAIN" push -q --force-with-lease="refs/heads/$b:$head" origin "$tip:refs/heads/$b" || {
+      echo "TRAIN $b: FAILED (could not update origin/$b; someone pushed to it)"
+      return 1
+    }
+  fi
+  case "$METHOD" in
+    push)
+      git -C "$TRAIN" push -q origin "$tip:refs/heads/$MAIN" 2>/dev/null || return 2
+      ;;
+    *)
+      (cd "$TRAIN" && gh pr merge "$b" "--$METHOD" --match-head-commit "$tip") || {
+        echo "TRAIN $b: FAILED (gh pr merge refused; see above)"
+        return 1
+      }
+      ;;
+  esac
+  git -C "$TRAIN" push -q origin --delete "$b" 2>/dev/null || true
+  git -C "$REPO" fetch -q origin 2>/dev/null || true
+  echo "TRAIN $b: LANDED $(git -C "$REPO" rev-parse --short "refs/remotes/origin/$MAIN")"
+}
+
+cmd_train() {
+  [ "$#" -gt 0 ] || die "usage: lanes train <branch>..."
+  GATE=$(cfg gate)
+  [ -n "$GATE" ] || die "no gate set: git config lanes.gate '<command>'"
+  METHOD=$(cfg merge squash)
+  case "$METHOD" in
+    squash | rebase | merge) command -v gh >/dev/null || die "gh is not installed (or set lanes.merge to push)" ;;
+    push) ;;
+    *) die "lanes.merge must be squash, rebase, merge or push" ;;
+  esac
+  TRAIN="$BASE/train"
+  mkdir -p "$BASE"
+  fetch
+  [ -d "$TRAIN" ] || git -C "$REPO" worktree add -q --detach "$TRAIN" "origin/$MAIN" >&2
+  local b rc failed=0 try
+  for b in "$@"; do
+    echo "=== $(date +%H:%M:%S) $b"
+    for try in 1 2 3; do
+      git -C "$REPO" fetch -q origin 2>/dev/null || true
+      rc=0
+      land "$b" || rc=$?
+      [ "$rc" -eq 2 ] || break
+      echo "$MAIN moved during the gate; retrying $b ($try/3)"
+    done
+    if [ "$rc" -eq 2 ]; then
+      echo "TRAIN $b: FAILED ($MAIN kept moving; run the train again)"
+    fi
+    [ "$rc" -eq 0 ] || failed=1
+  done
+  echo "TRAIN DONE $(date +%H:%M:%S)"
+  return "$failed"
+}
+
+case "${1:-status}" in
+  init) cmd_init ;;
+  status) cmd_status ;;
+  acquire) cmd_acquire "${2:-}" ;;
+  release) cmd_release "${2:-}" "${3:-}" ;;
+  gate) cmd_gate ;;
+  train)
+    shift
+    cmd_train "$@"
+    ;;
+  *) die "usage: lanes {init|status|acquire <branch>|release <n> [--force]|gate|train <branch>...}" ;;
+esac

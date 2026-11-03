@@ -1,0 +1,106 @@
+---
+name: lanes
+description: Run the lanes orchestrator. This session keeps three worker subagents busy on ready GitHub issues, each in its own git worktree, reviews every PR, and lands approved ones through a merge train until told to stop. Use when the user says /lanes, "fill the lanes", "run the lanes" or "work the backlog". `/lanes init` sets a repository up.
+---
+
+# /lanes: the orchestrator loop
+
+From now until the user says **stop**, this session is the **orchestrator**. It writes no product code. It keeps the lanes busy, reviews every diff, lands approved work through the train, and keeps a ledger.
+
+**Why this shape.** The session's model is the expensive one, so it only plans, reviews and decides. Implementation runs on `lanes:lane-worker` (Sonnet) and wide reading on `lanes:lane-reader` (Haiku, read-only). Each worker owns a git worktree, so three issues move at once without touching each other's files. The worker's reading stays in its own context; only its report comes back here.
+
+**The tool.** `lanes` is on the Bash PATH while this plugin is enabled. If it is not, use `${CLAUDE_PLUGIN_ROOT}/bin/lanes`, and put that absolute path in worker briefs.
+
+| Command | What it does |
+|---|---|
+| `lanes init` | create the lane worktrees (`<repo>-lanes/lane-N`, beside the repo) |
+| `lanes status` | each lane, free or leased, and the configured gate |
+| `lanes acquire <branch>` | lease a free lane on `<branch>` (resumes from `origin/<branch>` if it exists); prints the lane path |
+| `lanes release <n>` | reset lane `n` to main and free it; refuses while it holds unpushed work |
+| `lanes gate` | run the merge gate in the current directory |
+| `lanes train <branch>...` | for each branch in its own worktree: rebase onto main, run the gate, merge, delete the branch |
+
+Settings are git config keys: `lanes.gate` (required), `lanes.count` (3), `lanes.main` (origin's HEAD), `lanes.merge` (`squash`, `rebase` or `merge` through `gh`; `push` for a plain fast-forward), `lanes.base`.
+
+## `/lanes init`: one-time setup per repository
+
+Run this when the argument is `init`, or when start-up finds no lanes or no gate. Then stop.
+
+1. Check: inside a git repository whose `origin` is on GitHub, `gh auth status` logged in, `git --version` 2.31 or later.
+2. **The merge gate** is the one command that must pass before anything lands: tests plus lint or type checks, whatever this project treats as "green". Look in `CLAUDE.md`, the README, `package.json` scripts, `Makefile`, `justfile`, `pyproject.toml` and CI workflows. Propose it to the user with `AskUserQuestion`, then `git config lanes.gate '<command>'`. If main is protected against direct pushes, keep `lanes.merge` on `squash`; otherwise ask whether they prefer squash or `push`.
+3. `lanes init`; `lanes status` must list every lane.
+4. Labels, created if missing (`gh label create <name> --description <text> || true`): `ready-for-agent` (the queue), `needs-triage` (waits on a human decision), `dont-touch` (never worked by agents).
+5. Tell the user: setup done. Agent definitions load at session start, so if the plugin was installed in this session, restart Claude Code before `/lanes`.
+
+## 0. Start-up (each invocation)
+
+1. **Ledger.** Read or create `ledger.md` in the lanes base directory (the first line of `lanes status`). It records in-flight lanes (issue, branch, time), the train queue, what landed, the issue queue and process notes. Update it on every event. It is what survives a context compaction.
+2. `lanes status`. A lane leased by someone else stays theirs.
+3. **Queue.** `gh issue list --state open --label ready-for-agent --search '-label:dont-touch' --json number,title,labels --limit 100`. Never touch a `dont-touch` issue. `needs-triage` belongs to the user. Order: broken behaviour and failing CI first, then data or security correctness, then features, then chores.
+4. Tell the user in three lines what is starting.
+
+## 1. Dispatch
+
+For each free lane:
+
+1. **Pick an issue that does not overlap an in-flight lane** (same files, module, table or page). Overlapping issues run one after the other; note the dependency in the ledger.
+2. **Scope before dispatch.** Send `lanes:lane-reader` the issue text and a question: verify the issue's leads, and list every file, function, test file and module the change touches, with `path:line`. Post the answer on the issue as a `## Scoped` comment (`gh issue comment`). Over about five modules, split the issue first. Then read enough yourself to write the brief. Workers never call the reader; their own reading is where the judgement happens.
+3. `lanes acquire <type>/<N>-<slug>` (for example `fix/42-empty-cart`), which prints the lane path.
+4. `Agent` with `subagent_type: "lanes:lane-worker"`, `run_in_background: true`, and **no `model`** (the agent sets Sonnet). The brief carries:
+   - The lane path and branch, already leased.
+   - The issue number, and "address every acceptance item".
+   - **Leads** you verified, as `path:line`, marked "verify, don't trust". Existing helpers to reuse.
+   - The constraints that decide the issue: a design record, compatibility, performance, security.
+   - **The checks to run**: the project's focused test commands for what it touches, then `lanes gate`.
+   - Known overlap with other lanes.
+   - The commit trailer and PR footer, if the user uses attribution lines.
+5. Record the dispatch in the ledger and tell the user in one line.
+
+**Escalate** (`model: "opus"` on the Agent call) only when a lane has failed the same issue twice, or the work needs design-level judgement.
+
+## 2. Review (on each worker report)
+
+A worker stops at a pushed PR. Review before anything lands:
+
+1. `git -C <lane> fetch -q && git -C <lane> diff origin/<main>...HEAD --stat`, then read the diff of the logic. Skim fixtures and generated files.
+2. Check:
+   - The fix sits at the root, in the shared place, not at each call site.
+   - Every acceptance item is done or explicitly left open with a reason.
+   - New tests were fault-injected (the report names which assertion failed for which break).
+   - `lanes gate` ran green on the final commit, shown by real output, not a claim.
+   - No new trust holes: input escaping, authorisation, injection, secrets.
+   - Nothing outside the scope, and no stray files.
+3. **Send it back** (`SendMessage` to the worker) only for a real defect. Say exactly what is wrong and what shape you want.
+4. **Approve:**
+   - `lanes release <n>` and dispatch the next issue into that lane straight away.
+   - Add the branch to the train queue in the ledger.
+   - File follow-ups the worker surfaced: `ready-for-agent` when fully specified, `needs-triage` when a human must decide.
+   - Tell the user in one or two plain lines what the PR fixes.
+
+## 3. Merge train
+
+- When the queue is non-empty and no train is running: `lanes train <branch>...` with `run_in_background: true`. It lands branches one at a time in its own worktree, so the user's checkout is never switched. It prints one `TRAIN <branch>: LANDED|FAILED (<why>)|SKIPPED` line per branch.
+- Read only the `TRAIN` lines. On `FAILED`, read the output just above that line.
+- **LANDED:** check the issue closed (`Fixes #N` closes it on merge). If not, `gh issue close <N> --comment "<sha>: <one line of evidence>"`. A partial fix gets a comment naming what landed and what stays open.
+- **FAILED:** `lanes acquire <same branch>` (it resumes from `origin/<branch>`) and dispatch a worker with the failure text.
+- Never merge by hand while a train runs.
+
+## 4. Talking to the user
+
+- Short status lines on each event: what landed, what is running, what needs them. Plain language, result first, with a running tally.
+- Decisions that are theirs (product behaviour, scope, anything hard to undo) become a `needs-triage` issue. Keep working, and list the open ones in status updates. Use `AskUserQuestion` only when blocked.
+- Never tag a release, force-push shared history, or touch secrets without asking.
+
+## 5. Learning
+
+- A worker slip that repeats goes into the project's `CLAUDE.md` (a "Working in a lane" section), so every later worker reads it. Plugin files are overwritten on update; do not edit them.
+- Keep the ledger honest. Never claim a lane is running or a check passed without the notification or output to show it.
+
+## 6. Stop
+
+On "stop":
+
+- Dispatch nothing new.
+- Let in-flight workers finish to a PR, review them, and run a final train.
+- Release every lane you leased.
+- Report: issues closed, follow-ups filed, decisions waiting on the user, and any slips worth remembering.
