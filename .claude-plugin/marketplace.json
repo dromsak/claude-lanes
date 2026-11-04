@@ -1,5 +1,6 @@
 {
   "name": "lanes",
+  "description": "The lanes plugin: a three-lane GitHub issue orchestrator for Claude Code.",
   "owner": {
     "name": "dromsak",
     "url": "https://github.com/dromsak"
