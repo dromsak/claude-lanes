@@ -1,7 +1,7 @@
 {
   "name": "lanes",
   "description": "Work a GitHub issue backlog three at a time. The main session orchestrates and reviews; Sonnet workers implement, each in its own git worktree; a read-only Haiku reader scopes issues first; a merge train lands approved PRs one by one behind your test gate.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": {
     "name": "dromsak",
     "url": "https://github.com/dromsak"

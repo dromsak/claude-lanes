@@ -44,7 +44,11 @@ Run this when the argument is `init`, or when start-up finds no lanes or no gate
 For each free lane:
 
 1. **Pick an issue that does not overlap an in-flight lane** (same files, module, table or page). Overlapping issues run one after the other; note the dependency in the ledger.
-2. **Scope before dispatch.** Send `lanes:lane-reader` the issue text and a question: verify the issue's leads, and list every file, function, test file and module the change touches, with `path:line`. Post the answer on the issue as a `## Scoped` comment (`gh issue comment`). Over about five modules, split the issue first. Then read enough yourself to write the brief. Workers never call the reader; their own reading is where the judgement happens.
+2. **Scope before dispatch.** Before an issue reaches a lane, its leads are verified, and every file, function, test file and module it touches is listed with `path:line` in a `## Scoped` comment on the issue (`gh issue comment`). Over about five modules, split the issue first.
+   - **Small scope** (a failing test with a name, a one-module change): run the handful of greps yourself and post the comment. A reader round trip costs more than it saves.
+   - **Wide scope** (a trace across modules, an epic audit, a long log): send `lanes:lane-reader` the issue text and the question, then post its answer.
+
+   Either way, read enough yourself to write the brief. Workers never call the reader, because their own reading is where the judgement happens.
 3. `lanes acquire <type>/<N>-<slug>` (for example `fix/42-empty-cart`), which prints the lane path.
 4. `Agent` with `subagent_type: "lanes:lane-worker"`, `run_in_background: true`, and **no `model`** (the agent sets Sonnet). The brief carries:
    - The lane path and branch, already leased.
@@ -52,11 +56,22 @@ For each free lane:
    - **Leads** you verified, as `path:line`, marked "verify, don't trust". Existing helpers to reuse.
    - The constraints that decide the issue: a design record, compatibility, performance, security.
    - **The checks to run**: the project's focused test commands for what it touches, then `lanes gate`.
+   - **If the cause is a hypothesis, the fork, not a fix:** "find out which it is; if X, fix the code; if Y, fix the test; report which, with evidence". A prescribed fix built on a wrong guess either fails or gets built anyway.
    - Known overlap with other lanes.
    - The commit trailer and PR footer, if the user uses attribution lines.
 5. Record the dispatch in the ledger and tell the user in one line.
 
 **Escalate** (`model: "opus"` on the Agent call) only when a lane has failed the same issue twice, or the work needs design-level judgement.
+
+### Keeping the lanes full
+
+Most of a lane's wall time goes on the worker reading code and making edits. Builds and tests are usually a few minutes of it; check your own project's numbers once. So extra lanes help only with **file-disjoint** work. Splitting one tightly coupled change three ways makes each worker read the same context, adds rebase conflicts, and still ends in the same serial review and train.
+
+- **One big issue (an epic):** slice it by the files each part owns, not by feature. Dispatch the disjoint slices together and queue the dependent ones in the ledger. Each slice's PR says `Part of #N`, and you tick the slice off in the issue body when it lands.
+- **Decisions ahead of the lanes:** while the current slices run, ask the user for the calls the *next* slices need (§4), so a lane that frees up never waits for an answer.
+- **Overlap you can't avoid:** name it in both briefs. When one lands, `SendMessage` the other worker a rebase heads-up that names the files that moved.
+- **Several small fixes in one area** (two failing tests from one CI run): one branch, one lane. A lane per trivial item pays its reading and review twice.
+- **The queue about to empty:** prepare the release, such as the notes and changelog, while the last fix runs, then ask about the release in the same question batch as any open decisions.
 
 ## 2. Review (on each worker report)
 
@@ -88,7 +103,11 @@ A worker stops at a pushed PR. Review before anything lands:
 ## 4. Talking to the user
 
 - Short status lines on each event: what landed, what is running, what needs them. Plain language, result first, with a running tally.
-- Decisions that are theirs (product behaviour, scope, anything hard to undo) become a `needs-triage` issue. Keep working, and list the open ones in status updates. Use `AskUserQuestion` only when blocked.
+- Decisions that are theirs (product behaviour, scope, anything hard to undo) become a `needs-triage` issue. Keep working, and list the open ones in status updates.
+- **Ask with `AskUserQuestion`, never in prose.** Never end with "tell me which", and never list "waiting on you" items without asking them in the same turn. Ask only when work can't move on a sensible default.
+  - Batch up to four questions. Put the Recommended option first. Give a design choice an ASCII `preview` for each option.
+  - Record each answer on its issue.
+- **When the user is away** (outside the hours they gave you, or simply not answering), don't let a question stall the lanes. Take the reversible Recommended default, post it on the issue as an assumption, and confirm it in the next batch.
 - Never tag a release, force-push shared history, or touch secrets without asking.
 
 ## 5. Learning

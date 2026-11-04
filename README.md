@@ -19,6 +19,10 @@ It works with any language. The only project-specific input is your **gate**: th
 
 Each worker's file reading, test output and retries stay in its own context. The orchestrator only sees the brief it wrote and the report that comes back, so its context stays small enough to run a whole backlog in one session.
 
+## When three lanes help
+
+Most of a lane's time goes on the worker reading and editing, not on builds. Three lanes beat one only when they work on **different files**. When the backlog is one big issue, the orchestrator slices it by the files each part owns and runs the disjoint slices at once. It asks you for the next slices' decisions while those slices run, and it bundles small fixes in the same area into one lane. Splitting one tightly coupled change three ways is slower: every worker reads the same context, and the pieces collide when they land.
+
 ## The loop
 
 ```
