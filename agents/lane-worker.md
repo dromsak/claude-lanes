@@ -28,13 +28,14 @@ Acknowledge in one short paragraph: your lane path, branch, the issue, the check
 1. `gh issue view <N> --comments`: the body **and** the comments, including the `## Scoped` comment the orchestrator posted.
 2. **Trace the root cause before editing.** The leads in your brief are verified but not guaranteed: check them. Find every caller of what you change. Fix it once, in the shared place, not at each call site.
 3. Address **every** acceptance item. If one needs a human decision or is clearly a separate project, finish the rest and report that item as left open, with the reason and a concrete proposal. Do not guess product decisions.
-4. **Tests where they add signal** (logic, parsing, data access, output formats), at the cheapest layer that can see the defect. **Fault-inject each new test**: break the line it guards, confirm *that* assertion fails, then restore with the editor.
+4. **Tests where they add signal** (logic, parsing, data access, output formats), at the cheapest layer that can see the defect. **Fault-inject the regression test that guards your fix, and any new gate or check**: break the line it guards, confirm *that* assertion fails, then restore with the editor. Not every test you touch.
 5. **Iterate cheap, verify once.** While editing, run only the tests you are writing. When the change is done, run the full checks your brief names for everything you touched, then `lanes gate` in your lane (if `lanes` is not on your PATH: `${CLAUDE_PLUGIN_ROOT}/bin/lanes gate`). A shared helper, wording or type you changed: search the whole repo's tests for the old form and run those too. Zero tests selected is a failure, not a pass.
+   The checks in your brief are a **ceiling**: run each once. Don't re-run them after a clean squash or rebase, because the merge train gates your branch again. Run slow suites (browser, end-to-end) once, at the end, only for the flows you changed, and never in an edit loop. Past about 40 changed files, stop: push what is done and report the rest as the next slice.
 6. **Commit and push WIP after each step.** A crashed worker's uncommitted work is lost; pushed work is not.
 7. **Squash before the PR**, as three separate commands, each checked: `git fetch`, `git rebase origin/<main>`, then `git reset --soft origin/<main>` and a fresh commit. Resetting onto a main that moved silently reverts other people's landed work. Then `git diff origin/<main> --stat` must list only your files.
 8. **Commit message:** conventional, naming each defect fixed. `Fixes #N` only when every acceptance item is met (merging closes the issue); otherwise `Part of #N`. End with the attribution lines from your brief.
 9. Push and open a **non-draft PR**: what changed, acceptance state, how you verified, anything left open. Same `Fixes #N` / `Part of #N` rule.
-10. **Report** (your final message). Do not merge and do not close the issue. If the orchestrator sends the PR back, fix it, re-run the affected checks and `lanes gate`, push, and report again.
+10. **Report** (your final message). Do not merge and do not close the issue. If the orchestrator sends the PR back, fix it, re-run only the checks the fix affects and `lanes gate`, push, and report again.
 
 ## Habits that prevent the usual slips
 

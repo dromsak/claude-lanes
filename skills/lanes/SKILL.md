@@ -55,7 +55,7 @@ For each free lane:
    - The issue number, and "address every acceptance item".
    - **Leads** you verified, as `path:line`, marked "verify, don't trust". Existing helpers to reuse.
    - The constraints that decide the issue: a design record, compatibility, performance, security.
-   - **The checks to run**: the project's focused test commands for what it touches, then `lanes gate`.
+   - **The checks to run**: the project's focused test commands for what it touches, then `lanes gate`. Keep to the minimum that sees this change (the verification budget below); the list is a ceiling, not a floor.
    - **If the cause is a hypothesis, the fork, not a fix:** "find out which it is; if X, fix the code; if Y, fix the test; report which, with evidence". A prescribed fix built on a wrong guess either fails or gets built anyway.
    - Known overlap with other lanes.
    - The commit trailer and PR footer, if the user uses attribution lines.
@@ -63,9 +63,25 @@ For each free lane:
 
 **Escalate** (`model: "opus"` on the Agent call) only when a lane has failed the same issue twice, or the work needs design-level judgement.
 
+### Verification budget
+
+Checks pile up one lesson at a time until they cost more than the code. In one real round, lanes spent over 70% of their wall time inside repeated verification, and issues took one to two hours for 20–30 minutes of edits. Three habits caused most of it:
+- the same check list ran in the lane, again after every squash, rebase or send-back, and again in the train;
+- a slow shared suite (browser or end-to-end tests that run one at a time on the machine) was used as an edit loop, so every lane queued behind the others;
+- every test was fault-injected.
+
+Keep this as the default:
+- **The train's gate is the landing gate.** A worker runs the focused tests for what it touched and `lanes gate` once, on the final commit. It does not re-run them after a clean squash or rebase.
+- **Slow suites** (browser, end-to-end, visual) run once, at the end, and only for the flows the diff changed. Never in an edit loop, and never as a broad sweep "for safety".
+- **Fault-inject new gates and the regression test that guards the fix**, not every test touched along the way.
+- **About 20 files per PR.** Slice bigger issues into several PRs; past about 40 files, the worker stops and reports the rest as the next slice.
+- **A send-back names the one check the fix affects.** It never asks for the whole list again.
+
+Measure it: if lane time is mostly checks rather than edits, cut repeated checks before adding lanes.
+
 ### Keeping the lanes full
 
-Most of a lane's wall time goes on the worker reading code and making edits. Builds and tests are usually a few minutes of it; check your own project's numbers once. So extra lanes help only with **file-disjoint** work. Splitting one tightly coupled change three ways makes each worker read the same context, adds rebase conflicts, and still ends in the same serial review and train.
+Most of a lane's wall time goes on the worker reading code and making edits. Builds and tests should be a few minutes of it; check your own project's numbers once, and if they are not, apply the verification budget above. So extra lanes help only with **file-disjoint** work. Splitting one tightly coupled change three ways makes each worker read the same context, adds rebase conflicts, and still ends in the same serial review and train.
 
 - **One big issue (an epic):** slice it by the files each part owns, not by feature. Dispatch the disjoint slices together and queue the dependent ones in the ledger. Each slice's PR says `Part of #N`, and you tick the slice off in the issue body when it lands.
 - **Decisions ahead of the lanes:** while the current slices run, ask the user for the calls the *next* slices need (§4), so a lane that frees up never waits for an answer.
@@ -81,7 +97,7 @@ A worker stops at a pushed PR. Review before anything lands:
 2. Check:
    - The fix sits at the root, in the shared place, not at each call site.
    - Every acceptance item is done or explicitly left open with a reason.
-   - New tests were fault-injected (the report names which assertion failed for which break).
+   - New gates and the fix's regression test were fault-injected (the report names which assertion failed for which break).
    - `lanes gate` ran green on the final commit, shown by real output, not a claim.
    - No new trust holes: input escaping, authorisation, injection, secrets.
    - Nothing outside the scope, and no stray files.
