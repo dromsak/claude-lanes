@@ -94,7 +94,8 @@ A worker stops at a pushed PR. Review before anything lands:
 
 ## 3. Merge train
 
-- When the queue is non-empty and no train is running: `lanes train <branch>...` with `run_in_background: true`. It lands branches one at a time in its own worktree, so the user's checkout is never switched. It prints one `TRAIN <branch>: LANDED|FAILED (<why>)|SKIPPED` line per branch.
+- **Batch, never one issue at a time.** A train costs the same fixed price however many branches it carries: stopping anything that watches the checkout, warming builds, a gate run, the ledger round trip. Hold approved branches until **three or four** are queued. Run a smaller train only when no other approval is near (every lane is mid-task, or you are stopping) or when a queued item is waiting on that branch.
+- With a batch ready and no train running: `lanes train <branch>...` with `run_in_background: true`. It lands branches one at a time in its own worktree, so the user's checkout is never switched. It prints one `TRAIN <branch>: LANDED|FAILED (<why>)|SKIPPED` line per branch.
 - Read only the `TRAIN` lines. On `FAILED`, read the output just above that line.
 - **LANDED:** check the issue closed (`Fixes #N` closes it on merge). If not, `gh issue close <N> --comment "<sha>: <one line of evidence>"`. A partial fix gets a comment naming what landed and what stays open.
 - **FAILED:** `lanes acquire <same branch>` (it resumes from `origin/<branch>`) and dispatch a worker with the failure text.
